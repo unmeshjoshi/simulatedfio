@@ -1,82 +1,68 @@
 package simfio.future;
 
-import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
 
-public class TickableFileIO {
-    private final FileChannel channel;
-    ExecutorService executorService = Executors.newSingleThreadExecutor();
-    long tick = 0;
-    Map<Long, CallDetails> pendingCalls = new HashMap<>();
+/*
+ * FileIO contract
+ *
+ * Durability
+ *   - write completes when the bytes are visible to reads. They are not
+ *     necessarily durable.
+ *   - sync completes when everything written before it is durable. It covers
+ *     every write issued before it, because ops on a file execute and complete
+ *     in submission order.
+ *   - Don't assume anything about durability from a write future or from a
+ *     timeout. Only a completed sync tells you the data is durable.
+ *   - A failed sync is fatal. Don't retry it.
+ *   - truncate is a change like any write: it is visible at once and durable only after a completed sync.
+ *
+ * Buffers and sizes
+ *   - write copies the bytes between the buffer's position and limit when it is called. The caller's buffer is not
+ *     modified and may be reused at once.
+ *   - write completes with the full byte count, or fails. It never completes with a short count.
+ *   - read completes with a buffer holding only the bytes actually read: shorter than asked at the end of the file,
+ *     empty at or past it.
+ *   - truncate only shrinks. A size at or above the current size changes nothing.
+ *
+ * Lifecycle
+ *   - close is queued behind the calls already issued, so they finish first. Calls issued after close fail.
+ *
+ * Threading
+ *   - Call every method, including tick(), from one thread: the loop thread.
+ *   - Futures complete only inside tick(), on that thread.
+ *
+ * Ordering
+ *   - Calls on one instance execute and complete in the order they were issued.
+ *
+ * Not guaranteed
+ *   - Order across different files or different instances.
+ *   - A timed-out operation is not cancelled. It may still execute, and a later sync will cover it.
+ *   - The order in which unsynced writes reach the disk after a crash.
+ *
+ * Caller rule
+ *   - Don't issue an op that depends on another before its future completes, unless you rely on the order above.
+ */
+public interface TickableFileIO {
 
-    public void tick() {
-        tick++;
-        while (!otherThreadSubmissions.isEmpty()) {
-            Runnable poll = otherThreadSubmissions.poll();
-            poll.run();
-        }
+    /**
+     * Reads up to length bytes at offset. The buffer is ready to consume and holds only the bytes actually read:
+     * shorter than length at the end of the file, empty at or past it.
+     */
+    TickCompletableFuture<ByteBuffer> read(long offset, int length);
 
-    }
+    TickCompletableFuture<Integer> write(ByteBuffer buffer, long offset);
 
-    static record Timeout(long deadline) {
-        public boolean isExpired(long now) {
-            return now > deadline;
-        }
-    }
+    /** Completes when everything written before this call is durable. A failure is fatal; do not retry. */
+    TickCompletableFuture<Void> sync();
 
-    static class CallDetails {
-        Timeout timeout;
-        TickCompletableFuture<Integer> future;
+    TickCompletableFuture<Long> size();
 
-        public CallDetails(long deadline, TickCompletableFuture<Integer> future) {
-            this.timeout = new Timeout(deadline);
-            this.future = future;
-        }
-    }
+    /** Shrinks the file to newSize. Does nothing if newSize is not smaller than the current size. */
+    TickCompletableFuture<Void> truncate(long newSize);
 
-    public TickableFileIO(FileChannel channel) {
-        this.channel = channel;
-    }
+    /** Closes the file after the calls issued before it. Calls issued afterwards fail. */
+    TickCompletableFuture<Void> close();
 
-    long nextCorrelationId = 0;
-
-    public TickCompletableFuture<Integer> write(ByteBuffer buffer, long offset) throws IOException {
-        TickCompletableFuture<Integer> future = new TickCompletableFuture<>();
-        long deadline = System.nanoTime() + 10000;
-        long correlationId = nextCorrelationId;
-        pendingCalls.put(correlationId, new CallDetails(deadline, future));
-        executorService.submit(() -> {
-            int bytesWritten = 0;
-            try {
-                bytesWritten = channel.write(buffer, offset);
-                handleCallResponse(correlationId, bytesWritten);
-            } catch (IOException e) {
-                future.fail(e);
-            }
-
-        });
-        return future;
-    }
-
-    LinkedBlockingQueue<Runnable> otherThreadSubmissions = new LinkedBlockingQueue<>();
-
-    private void handleCallResponse(long correlationId, int bytesWritten) {
-        try {
-            otherThreadSubmissions.put(() -> {
-                CallDetails details = pendingCalls.remove(correlationId);
-                if (details != null) {
-                    details.future.complete(bytesWritten);
-                }
-            });
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        }
-    }
+    /** Completes the futures of finished calls. Call about once per millisecond from the loop thread. */
+    void tick();
 }
