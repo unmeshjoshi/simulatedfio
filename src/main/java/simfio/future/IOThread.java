@@ -10,12 +10,12 @@ import java.util.concurrent.RejectedExecutionException;
  * Runs blocking calls one at a time, in submission order, on a single thread. The thread never completes a future:
  * when a call finishes it only queues the completion, and the owner's thread runs it in {@link #pollCompletions()}.
  */
-final class IOThread {
+public final class IOThread {
     final ExecutorService executor = Executors.newSingleThreadExecutor();
     // The only structure shared with the owner's thread: tasks that complete futures.
     private final LinkedBlockingQueue<Runnable> completions = new LinkedBlockingQueue<>();
 
-    <T> TickCompletableFuture<T> submit(Callable<T> call) {
+    public <T> TickCompletableFuture<T> submit(Callable<T> call) {
         TickCompletableFuture<T> future = new TickCompletableFuture<>();
         try {
             executor.submit(() -> {
@@ -33,7 +33,7 @@ final class IOThread {
     }
 
     /** Runs the completions of finished calls, in the order they finished. Owner's thread only. */
-    void pollCompletions() {
+    public void pollCompletions() {
         Runnable completion;
         while ((completion = completions.poll()) != null) {
             completion.run();
@@ -41,7 +41,7 @@ final class IOThread {
     }
 
     /** Already queued calls still run. Later submits are rejected. */
-    void shutdown() {
+    public void shutdown() {
         executor.shutdown();
     }
 }

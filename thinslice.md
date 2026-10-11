@@ -31,7 +31,7 @@ Packages: new code goes in `simfio.wal` for now and moves to the workshop when t
 4. **`Wal.append(List<byte[]>)`.** Encode the whole batch first (it may throw), then `offset = nextOffset; nextOffset = offset + encoded.length`, where `encoded.length` is the total size of the encoded batch (every record's length field, CRC and payload), not the sum of the payload sizes. Then `file.write(encoded, offset)`. Return a future with `offset`, the position of the first record, completed when the write completes.
 5. **`Wal.sync()` and `durableOffset()`.** Record `covered = nextOffset` at call time, call `file.sync()`, and on success set `durableOffset = max(durableOffset, covered)`. The returned future carries the durable offset.
 6. **Failure handling.** A failed write or sync fails its own future and poisons the `Wal`. Later `append` and `sync` calls fail at once.
-7. **`Wal.recover()`.** Read the file from offset 0 in chunks, decode records, and stop at the first invalid one. Return `Entry(offset, payload)` in order. Set `nextOffset` and `durableOffset` to the end of the last valid record. The slice leaves out the truncate-and-sync at the end of recovery.
+7. **`Wal.recover()`.** Read the file from offset 0 in chunks, decode records, and stop at the first invalid one. Return `Entry(offset, payload)` in order. Set `nextOffset` and `durableOffset` to the end of the last valid record. Then truncate the file to that offset and sync if anything followed it, and only then become `READY`. Without the cut, a record that survived a crash beyond a lost one can rejoin the log once a later append fills the gap.
 8. **`Wal` state.** `NEW` until `recover()` completes, then `READY`, then `POISONED` on failure. `append` and `sync` before `recover()` are rejected.
 9. **`Wal` tests on a stub file.** Use a manual `TickableFileIO` stub (like `ManualFileIO` in `TimeBoundedFileIOTest`) to check these:
    - three back-to-back appends reach the file at offsets 0, `len1` and `len1 + len2`;
@@ -115,4 +115,4 @@ Because both sit behind `FileIO`, `Wal`, `BatchedLog` and the consensus code run
 Caveat for the tick column: TigerBeetle has no storage I/O timeout (its io_uring loop says "enforcing timeout here is impossible, so don't even try"). `TimeBoundedFileIO` is our addition, and it is closer to FDB's `ioTimeout` in `AsyncFileKAIO` than to anything in TigerBeetle, only counted in ticks. The tick model is TigerBeetle's. The timeout wrapper is not.
 
 ## Not in this slice
-Fault injection beyond the crash rule, truncate-and-sync at the end of recovery, sector padding, file header, preallocation, rotation, and the port to tickloom. The FDB-style tasks above (17 to 23) come after the slice. See `NOTES.md` for what remains.
+Fault injection beyond the crash rule, sector padding, file header, preallocation, rotation, and the port to tickloom. The FDB-style tasks above (17 to 23) come after the slice. See `NOTES.md` for what remains.
