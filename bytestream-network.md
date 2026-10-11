@@ -2,7 +2,7 @@
 
 This document explains how to build and simulate a network at the byte-stream level: connections that carry bytes in order, with partial reads and writes, delays, resets and backpressure. It is the design for stage 2 of `networkslice.md`. Stage 1 (message-level `Network`, both styles) is described there.
 
-Status: design. Nothing here is implemented yet. Statements about FoundationDB, TigerBeetle and tickloom come from reading their sources in this session (`fdbrpc/sim2.actor.cpp`, `flow/include/flow/network.h`, `src/testing/packet_simulator.zig`, `src/message_bus.zig`, `tickloom/network/*`) and are marked as such. Everything else is our design.
+Status: design. Nothing here is implemented in the repo; an earlier prototype was deleted so that it can be rewritten from scratch. Statements about FoundationDB, TigerBeetle and tickloom come from reading their sources in this session (`fdbrpc/sim2.actor.cpp`, `flow/include/flow/network.h`, `src/testing/packet_simulator.zig`, `src/message_bus.zig`, `tickloom/network/*`) and are marked as such. Everything else is our design.
 
 ## 1. Purpose
 
@@ -57,8 +57,9 @@ interface Transport {
 }
 
 interface Listener {
+    Address address();                            // the address actually bound (port 0 picks a free one)
     TickCompletableFuture<Connection> accept();   // the next incoming connection
-    void close();                                 // a pending accept fails
+    void close();                                 // a pending accept fails, and the backlog is aborted
 }
 
 interface Connection {
@@ -100,6 +101,11 @@ This is FoundationDB's `IConnection` shape (`flow/include/flow/network.h`): non-
 **Threading and time**
 15. All calls, and the driver, run on the loop thread. Time is whatever the driver says.
 
+Implementation notes on the contract:
+- A pending readiness future may complete or fail when the connection dies; the next `read` or `write` throws. The simulator fails it, and NIO completes it (the key becomes ready) and lets the `read` throw. Callers must handle both, and `ReadLoop` and `WriteLoop` do.
+- A readiness future may complete when nothing has changed. The caller retries and may get 0 again.
+- `write` returning 0 because of an injected partial-write fault is allowed: `onWritable()` completes at once whenever room exists, so the caller is never left waiting.
+
 ## 7. The simulation model
 
 ### 7.1 Time and the scheduler seam
@@ -108,6 +114,7 @@ A simulated `write` does not deliver anything; it schedules a delivery. `SimConn
 
 ```java
 interface Scheduler {
+    long now();                                       // the scheduler's own time
     void schedule(long delay, Runnable task);         // run `task` after `delay` units of the scheduler's own time
     default void post(Runnable task) { schedule(0, task); }
 }
@@ -204,7 +211,7 @@ Capacity counts bytes in flight plus bytes delivered and not yet read. A reader 
 
 ### 7.9 Listen, accept and connect
 
-A `SimNetwork` object keeps a map from `Address` to `SimListener`.
+A `SimNetwork` object keeps a map from `Address` to `SimListener`. Each host gets a `SimTransport` from `network.transport(host)`; partitions and clogs are between hosts. Connecting to an address nobody listens on, or across a partition, fails with `ConnectException` after the connect delay.
 
 ```
 connect(to):
