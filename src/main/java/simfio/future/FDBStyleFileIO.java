@@ -30,6 +30,8 @@ public class FDBStyleFileIO {
         final LinkedBlockingQueue<Runnable> otherThreadSubmissions = new LinkedBlockingQueue<>();
 
         final PriorityQueue<Task> queue = new PriorityQueue<>();
+
+        //set by the driver main loop or tests once per iteration.
         private long now = 0;
         private long nextSeq = 0;
 

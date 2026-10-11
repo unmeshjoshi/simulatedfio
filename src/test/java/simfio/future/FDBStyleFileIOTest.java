@@ -28,15 +28,15 @@ class FDBStyleFileIOTest {
      * its timeout relative to the queue's current time. Bounded so a bug fails instead of hanging.
      */
     private void runUntilDone(FDBStyleFileIO.TaskQueue taskQueue, TickCompletableFuture<?>... futures) {
-        pump(taskQueue, true, futures);
+        runUntilDone(taskQueue, true, futures);
     }
 
     /** Same loop, but the clock stays where the test put it: virtual time. */
     private void runUntilDoneAtFixedTime(FDBStyleFileIO.TaskQueue taskQueue, TickCompletableFuture<?>... futures) {
-        pump(taskQueue, false, futures);
+        runUntilDone(taskQueue, false, futures);
     }
 
-    private void pump(FDBStyleFileIO.TaskQueue taskQueue, boolean realClock, TickCompletableFuture<?>... futures) {
+    private void runUntilDone(FDBStyleFileIO.TaskQueue taskQueue, boolean realClock, TickCompletableFuture<?>... futures) {
         long giveUp = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < giveUp) {
             boolean pending = false;

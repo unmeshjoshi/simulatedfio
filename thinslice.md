@@ -69,6 +69,32 @@ The slice runs on the tick-driven stack. These tasks bring `FDBStyleFileIO` onto
 22. **Run the end-to-end test on both stacks.** The same `Wal` test with `SingleThreadedFileIO` inside `TimeBoundedFileIO`, and with `FDBStyleFileIO`.
 23. **Second `BatchedLog` variant.** The group wait as a task scheduled on the `TaskQueue` (the FDB commit-proxy style), next to the tick-counted variant. Both share the waiter queue and the completion logic, and differ only in how the flush is triggered.
 
+## File system: creating and opening files
+
+The slice so far takes one open `FileIO`. A process needs more than that: it creates, opens, lists, renames and deletes files, and a restarted process must find its files again. `FileSystem` is the layer that owns names; `FileIO` stays the layer that owns the bytes of one file.
+
+```
+FileSystem                 open, exists, list, delete, rename, syncDirectory
+   RealFileSystem          a directory on disk; opens a FileChannel and wraps it in SingleThreadedFileIO
+   SimulatedFileSystem     in-memory files; owns the crash rule
+FileIO                     one open file (unchanged)
+```
+
+Decisions:
+- Flat namespace: names only, no subdirectories and no permissions.
+- Every call returns a future, like `FileIO`, so the simulator can delay or fail it. The driving model is the same: `FileSystem` is the contract, and the tick-driven implementations also have `tick()`.
+- A file belongs to the filesystem. The filesystem hands out `FileIO` handles and can invalidate all of them at once, which is how a simulated crash works.
+- Directory durability follows POSIX: a created, deleted or renamed file is durable only after `syncDirectory()` completes. A `sync` on the file does not cover its name.
+- Same caller rule as `FileIO`: ops execute and complete in the order issued.
+
+24. **`FileSystem` interface and contract.** `open(name, mode)` with `CREATE_NEW`, `OPEN_EXISTING` and `OPEN_OR_CREATE`, returning a `FileIO`; `exists`, `list`, `delete`, `rename`, `syncDirectory`. Write the contract comment: ordering, the directory-durability rule, what `open` fails with (missing file, file already exists), and that handles die with the filesystem. `TickableFileSystem extends FileSystem` adds `tick()`.
+25. **`RealFileSystem`.** A directory plus one I/O thread. `open` creates the `FileChannel` and returns a `SingleThreadedFileIO` (inside `TimeBoundedFileIO` if configured). `syncDirectory` fsyncs the directory channel.
+26. **Filesystem contract tests.** An abstract test over a `FileSystemFixture` (`driveOnce()` as in task 19): create then open; `CREATE_NEW` on an existing file fails; `OPEN_EXISTING` on a missing file fails; `list` shows created files and not deleted ones; `rename` replaces the name; `delete` of a missing file fails. Run on `RealFileSystem` first.
+27. **Use it in the end-to-end test.** Task 14 and the torn-tail test (15) open their file through `RealFileSystem`, and "reopen with a new `Wal`" becomes `fileSystem.open(name, OPEN_EXISTING)`.
+28. **`SimulatedFileSystem`.** In-memory files with seeded latency per call, behind `TickableFileSystem`. It returns `SimulatedFileIO` handles (the simulated file, built after the slice). It keeps two states per file: what reads see, and what is durable.
+29. **Crash and restart.** `crash()` invalidates every open handle, drops names that were not made durable by `syncDirectory`, and for each file keeps the synced bytes and keeps, drops or tears (at a sector boundary, chosen by the seeded `Random`) the unsynced writes. `restart()` lets the process open its files again. Tests: synced data survives; a created file without `syncDirectory` can vanish; an unsynced tail can be torn; the same seed gives the same outcome. Then run the `Wal` recovery test (15) against it.
+30. **Run the filesystem contract tests on `SimulatedFileSystem`**, and on an FDB-style variant if `FDBStyleFileIO` needs one.
+
 ## FDB style versus tick style
 
 `FileIO` and the test fixture show where the two styles match and where they differ. The contract is the same, and `driveOnce()` in each fixture holds the whole difference.
@@ -89,4 +115,4 @@ Because both sit behind `FileIO`, `Wal`, `BatchedLog` and the consensus code run
 Caveat for the tick column: TigerBeetle has no storage I/O timeout (its io_uring loop says "enforcing timeout here is impossible, so don't even try"). `TimeBoundedFileIO` is our addition, and it is closer to FDB's `ioTimeout` in `AsyncFileKAIO` than to anything in TigerBeetle, only counted in ticks. The tick model is TigerBeetle's. The timeout wrapper is not.
 
 ## Not in this slice
-Simulated file, crash and fault injection, truncate-and-sync at the end of recovery, sector padding, file header, preallocation, rotation, and the port to tickloom. The FDB-style tasks above (17 to 23) come after the slice. See `TODO.md` for the full plan.
+Fault injection beyond the crash rule, truncate-and-sync at the end of recovery, sector padding, file header, preallocation, rotation, and the port to tickloom. The FDB-style tasks above (17 to 23) come after the slice. See `NOTES.md` for what remains.
