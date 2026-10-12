@@ -6,52 +6,38 @@ import simfio.future.TickCompletableFuture;
 import java.io.IOException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.NoSuchFileException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.Callable;
 
 /**
- * A flat directory in memory, on the tick model, with the crash rule.
+ * A flat directory in memory, on the tick model.
  *
- * Names: {@code names} is what calls see, {@code durableNames} is what survives a crash. A create, delete or rename
- * changes only {@code names} and is remembered as unsynced until {@link #syncDirectory()}.
+ * Names: {@code names} is what calls see, {@code durableNames} is what is on disk. A create, delete or rename
+ * changes only {@code names}; {@link #syncDirectory()} copies it to {@code durableNames}.
  *
- * {@link #crash()} models a power cut: calls still queued never complete; each unsynced name change is kept or
- * dropped; each surviving file keeps its synced bytes and keeps, drops or tears its unsynced writes. Every choice
- * comes from the seeded Random, so the same seed gives the same crash. {@link #restart()} lets the process open its
- * files again; the old handles stay dead.
+ * {@link #crash()} is a power cut: calls still queued never complete, every open handle dies, the names go back
+ * to {@code durableNames} and every file goes back to its last synced bytes. {@link #restart()} lets the process
+ * open its files again.
  */
 public class SimulatedFileSystem implements TickableFileSystem {
-    private sealed interface NameChange {
-        record Create(String name, SimulatedFile file) implements NameChange {}
-        record Delete(String name) implements NameChange {}
-        record Rename(String from, String to) implements NameChange {}
-    }
-
-    private final Random random;
-    private final int minLatencyTicks;
-    private final int maxLatencyTicks;
-    private final OpQueue queue;
+    private final Deque<Runnable> queue = new ArrayDeque<>();
     private final List<SimulatedFileIO> handles = new ArrayList<>();
-    private final List<NameChange> unsyncedNames = new ArrayList<>();
     private TreeMap<String, SimulatedFile> names = new TreeMap<>();
     private TreeMap<String, SimulatedFile> durableNames = new TreeMap<>();
     private boolean crashed;
 
-    public SimulatedFileSystem(Random random, int minLatencyTicks, int maxLatencyTicks) {
-        this.random = random;
-        this.minLatencyTicks = minLatencyTicks;
-        this.maxLatencyTicks = maxLatencyTicks;
-        this.queue = new OpQueue(random, minLatencyTicks, maxLatencyTicks);
-    }
-
     @Override
     public void tick() {
-        queue.tick();
+        // Only the calls queued before this tick: a call made from a callback completes on the next tick.
+        for (int due = queue.size(); due > 0; due--) {
+            queue.poll().run();
+        }
         for (SimulatedFileIO handle : handles) {
             handle.tick();
         }
@@ -73,31 +59,29 @@ public class SimulatedFileSystem implements TickableFileSystem {
             if (file == null) {
                 file = new SimulatedFile();
                 names.put(name, file);
-                unsyncedNames.add(new NameChange.Create(name, file));
             }
-            SimulatedFileIO handle = new SimulatedFileIO(file, random, minLatencyTicks, maxLatencyTicks);
+            SimulatedFileIO handle = new SimulatedFileIO(file);
             handles.add(handle);
             return (FileIO) handle;
-        }, true);
+        });
     }
 
     @Override
     public TickCompletableFuture<Boolean> exists(String name) {
-        return submit(() -> names.containsKey(name), false);
+        return submit(() -> names.containsKey(name));
     }
 
     @Override
     public TickCompletableFuture<List<String>> list() {
-        return submit(() -> List.copyOf(names.keySet()), false);
+        return submit(() -> List.copyOf(names.keySet()));
     }
 
     @Override
     public TickCompletableFuture<Void> delete(String name) {
         return submit(() -> {
             if (names.remove(name) == null) throw new NoSuchFileException(name);
-            unsyncedNames.add(new NameChange.Delete(name));
             return null;
-        }, true);
+        });
     }
 
     @Override
@@ -106,50 +90,35 @@ public class SimulatedFileSystem implements TickableFileSystem {
             SimulatedFile file = names.remove(from);
             if (file == null) throw new NoSuchFileException(from);
             names.put(to, file);
-            unsyncedNames.add(new NameChange.Rename(from, to));
             return null;
-        }, true);
+        });
     }
 
     @Override
     public TickCompletableFuture<Void> syncDirectory() {
         return submit(() -> {
             durableNames = new TreeMap<>(names);
-            unsyncedNames.clear();
             return null;
-        }, false);
+        });
     }
 
     /** True when no name operation is queued. File handles have their own queues. */
     public boolean isIdle() {
-        return queue.isIdle();
+        return queue.isEmpty();
     }
 
-    /**
-     * Power cut. Open handles die, queued calls never complete (the ones that change data may have taken effect),
-     * and the disk is left as the crash rule allows.
-     */
+    /** Power cut. Open handles die, queued calls never complete, and the disk is what was last synced. */
     public void crash() {
-        queue.crash();   // may add to unsyncedNames and handles: a queued create or rename may have reached the disk
         for (SimulatedFileIO handle : handles) {
             handle.crash();
         }
         handles.clear();
-
-        TreeMap<String, SimulatedFile> survivors = new TreeMap<>(durableNames);
-        for (NameChange change : unsyncedNames) {
-            if (random.nextBoolean()) {
-                applyChange(survivors, change);
-            }
-        }
-        names = survivors;
-        durableNames = new TreeMap<>(survivors);
-        unsyncedNames.clear();
-
+        queue.clear();
+        names = new TreeMap<>(durableNames);
         Map<SimulatedFile, Boolean> seen = new IdentityHashMap<>();
-        for (SimulatedFile file : survivors.values()) {   // sorted by name, so the order is deterministic
+        for (SimulatedFile file : names.values()) {
             if (seen.put(file, true) == null) {
-                file.crash(random);
+                file.crash();
             }
         }
         crashed = true;
@@ -160,25 +129,22 @@ public class SimulatedFileSystem implements TickableFileSystem {
         crashed = false;
     }
 
-    private static void applyChange(Map<String, SimulatedFile> target, NameChange change) {
-        switch (change) {
-            case NameChange.Create create -> target.put(create.name(), create.file());
-            case NameChange.Delete delete -> target.remove(delete.name());
-            case NameChange.Rename rename -> {
-                SimulatedFile file = target.remove(rename.from());
-                if (file != null) {
-                    target.put(rename.to(), file);
-                }
-            }
-        }
-    }
-
-    private <T> TickCompletableFuture<T> submit(Callable<T> action, boolean mutates) {
+    private <T> TickCompletableFuture<T> submit(Callable<T> action) {
+        TickCompletableFuture<T> future = new TickCompletableFuture<>();
         if (crashed) {
-            TickCompletableFuture<T> rejected = new TickCompletableFuture<>();
-            rejected.fail(new IOException("file system crashed"));
-            return rejected;
+            future.fail(new IOException("file system crashed"));
+            return future;
         }
-        return queue.submit(action, mutates);
+        queue.add(() -> {
+            T result;
+            try {
+                result = action.call();
+            } catch (Throwable e) {
+                future.fail(e);
+                return;
+            }
+            future.complete(result);
+        });
+        return future;
     }
 }

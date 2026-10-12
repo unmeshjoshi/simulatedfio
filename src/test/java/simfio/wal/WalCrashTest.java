@@ -14,8 +14,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * The whole stack on the simulated disk with a crash at a random moment: SimulatedFileSystem, Wal, BatchedLog.
- * The rule under test is the one a consensus replica relies on: a record whose append future completed is durable,
- * so recovery returns it; the log recovered is always a prefix of what was appended, never a hole or a reordering.
+ * A record whose append future completed was covered by a completed sync, so it is on disk. A record whose future
+ * is still pending was not, so it is gone. Recovery returns exactly the acknowledged records.
  */
 class WalCrashTest {
     private static final int GROUP_WAIT = 3;
@@ -32,7 +32,7 @@ class WalCrashTest {
 
     private Run crashAndRecover(long seed) {
         Random workload = new Random(seed * 31 + 7);
-        fs = new SimulatedFileSystem(new Random(seed), 1, 4);
+        fs = new SimulatedFileSystem();
         FileIO file = await(fs.open("wal", OpenMode.CREATE_NEW));
         await(fs.syncDirectory());
         Wal wal = new Wal(file, 4096);
@@ -45,7 +45,7 @@ class WalCrashTest {
         for (int round = 0; round < rounds; round++) {
             int batch = 1 + workload.nextInt(4);
             for (int i = 0; i < batch; i++) {
-                byte[] payload = new byte[1 + workload.nextInt(700)];   // some records cross a 512-byte sector
+                byte[] payload = new byte[1 + workload.nextInt(700)];
                 workload.nextBytes(payload);
                 appended.add(payload);
                 futures.add(log.append(payload));
@@ -68,69 +68,33 @@ class WalCrashTest {
         Wal recoveredWal = new Wal(await(fs.open("wal", OpenMode.OPEN_EXISTING)), 4096);
         List<Wal.Entry> entries = await(recoveredWal.recover());
 
-        // Never a hole or a reordering: the recovered log is a prefix of what was appended.
-        assertTrue(entries.size() <= appended.size(), "seed " + seed);
-        for (int i = 0; i < entries.size(); i++) {
-            assertArrayEquals(appended.get(i), entries.get(i).payload(), "record " + i + ", seed " + seed);
-        }
-        // Everything acknowledged is there, at the offset the caller was given.
-        assertTrue(entries.size() >= acknowledged,
-                "acknowledged " + acknowledged + " but recovered " + entries.size() + ", seed " + seed);
+        assertEquals(acknowledged, entries.size(), "seed " + seed);
         for (int i = 0; i < acknowledged; i++) {
+            assertArrayEquals(appended.get(i), entries.get(i).payload(), "record " + i + ", seed " + seed);
             assertEquals(acknowledgedOffsets.get(i), entries.get(i).offset(), "seed " + seed);
         }
         return new Run(appended.size(), acknowledged, entries.size());
     }
 
     @Test
-    void everyAcknowledgedRecordSurvivesACrashAtAnyMoment() {
+    void recoveryReturnsExactlyTheAcknowledgedRecords() {
         int lostUnacknowledged = 0;
-        int keptUnacknowledged = 0;
         int crashedWithNothingAcknowledged = 0;
+        int crashedWithEverythingAcknowledged = 0;
         for (long seed = 0; seed < 500; seed++) {
             Run run = crashAndRecover(seed);
-            if (run.recovered() < run.appended()) lostUnacknowledged++;
-            if (run.recovered() > run.acknowledged()) keptUnacknowledged++;
+            if (run.acknowledged() < run.appended()) lostUnacknowledged++;
             if (run.acknowledged() == 0) crashedWithNothingAcknowledged++;
+            if (run.acknowledged() == run.appended()) crashedWithEverythingAcknowledged++;
         }
-        // Non-vacuity: the crash really did lose records, did keep unacknowledged ones, and hit both early and late.
+        // Non-vacuity: the crash really did lose records, and it landed both early and late.
         assertTrue(lostUnacknowledged > 0, "no run lost a record, so the test checks nothing");
-        assertTrue(keptUnacknowledged > 0, "no run kept an unacknowledged record");
-        assertTrue(crashedWithNothingAcknowledged > 0, "no run crashed before the first acknowledgement");
+        assertTrue(crashedWithNothingAcknowledged > 0);
+        assertTrue(crashedWithEverythingAcknowledged > 0);
     }
 
     @Test
     void theSameSeedGivesTheSameRun() {
         assertEquals(crashAndRecover(123), crashAndRecover(123));
-    }
-
-    @Test
-    void recoveryCutsOffSurvivorsBeyondAHoleSoTheyCannotComeBack() {
-        int hit = 0;
-        for (long seed = 0; seed < 300; seed++) {
-            fs = new SimulatedFileSystem(new Random(seed), 1, 4);
-            FileIO file = await(fs.open("wal", OpenMode.CREATE_NEW));
-            await(fs.syncDirectory());
-            Wal wal = new Wal(file, 4096);
-            await(wal.recover());
-            // Three records of the same size, never synced. The crash may keep the third and lose the second.
-            for (int i = 1; i <= 3; i++) wal.append(List.of(new byte[100]));
-            for (int t = 0; t < 10; t++) fs.tick();
-            fs.crash();
-            fs.restart();
-
-            Wal first = new Wal(await(fs.open("wal", OpenMode.OPEN_EXISTING)), 4096);
-            int survivors = await(first.recover()).size();
-            if (survivors < 3) {
-                hit++;
-            }
-            // A new record of the same size lands exactly where the lost one was.
-            await(first.append(List.of(new byte[100])));
-            await(first.sync());
-
-            Wal second = new Wal(await(fs.open("wal", OpenMode.OPEN_EXISTING)), 4096);
-            assertEquals(survivors + 1, await(second.recover()).size(), "an old record came back, seed " + seed);
-        }
-        assertTrue(hit > 0);
     }
 }

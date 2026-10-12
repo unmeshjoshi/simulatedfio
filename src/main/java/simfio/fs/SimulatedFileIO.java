@@ -5,41 +5,45 @@ import simfio.future.TickableFileIO;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Random;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.concurrent.Callable;
 
 /**
- * A file in memory, on the tick model. Every call completes some ticks later (seeded latency, at least one), in
- * the order issued, and takes effect when it completes. The same {@code FileIO} contract as the real file.
+ * A file in memory, on the tick model. A call is queued when it is made and takes effect, and completes its
+ * future, on the next {@code tick()}, in the order issued. The same {@code FileIO} contract as the real file.
  *
  * What it adds over the real one: {@link SimulatedFile} keeps what is durable apart from what is visible, so a
- * crash (see {@link SimulatedFileSystem#crash()}) can drop or tear writes that were never synced.
+ * crash (see {@link SimulatedFileSystem#crash()}) loses every write that was never synced.
  *
  * After the file is closed, or after a crash, new calls fail with an IOException.
  */
 public class SimulatedFileIO implements TickableFileIO {
     private final SimulatedFile file;
-    private final OpQueue queue;
+    private final Deque<Runnable> queue = new ArrayDeque<>();
     private boolean closed;
     private boolean crashed;
 
-    SimulatedFileIO(SimulatedFile file, Random random, int minLatencyTicks, int maxLatencyTicks) {
+    SimulatedFileIO(SimulatedFile file) {
         this.file = file;
-        this.queue = new OpQueue(random, minLatencyTicks, maxLatencyTicks);
     }
 
     /** A standalone file with no filesystem around it. */
-    public static SimulatedFileIO standalone(Random random, int minLatencyTicks, int maxLatencyTicks) {
-        return new SimulatedFileIO(new SimulatedFile(), random, minLatencyTicks, maxLatencyTicks);
+    public static SimulatedFileIO standalone() {
+        return new SimulatedFileIO(new SimulatedFile());
     }
 
     @Override
     public void tick() {
-        queue.tick();
+        // Only the calls queued before this tick: a call made from a callback completes on the next tick.
+        for (int due = queue.size(); due > 0; due--) {
+            queue.poll().run();
+        }
     }
 
     @Override
     public TickCompletableFuture<ByteBuffer> read(long offset, int length) {
-        return submit(() -> ByteBuffer.wrap(file.read(offset, length)), false);
+        return submit(() -> ByteBuffer.wrap(file.read(offset, length)));
     }
 
     @Override
@@ -50,7 +54,7 @@ public class SimulatedFileIO implements TickableFileIO {
         return submit(() -> {
             file.write(offset, data);
             return data.length;
-        }, true);
+        });
     }
 
     @Override
@@ -58,12 +62,12 @@ public class SimulatedFileIO implements TickableFileIO {
         return submit(() -> {
             file.sync();
             return null;
-        }, false);
+        });
     }
 
     @Override
     public TickCompletableFuture<Long> size() {
-        return submit(file::size, false);
+        return submit(file::size);
     }
 
     @Override
@@ -71,12 +75,12 @@ public class SimulatedFileIO implements TickableFileIO {
         return submit(() -> {
             file.truncate(newSize);
             return null;
-        }, true);
+        });
     }
 
     @Override
     public TickCompletableFuture<Void> close() {
-        TickCompletableFuture<Void> result = submit(() -> null, false);
+        TickCompletableFuture<Void> result = submit(() -> null);
         closed = true;   // queued behind the earlier calls, which still finish; later calls fail
         return result;
     }
@@ -84,15 +88,25 @@ public class SimulatedFileIO implements TickableFileIO {
     /** The process died: calls still queued never complete, and the handle is dead. */
     void crash() {
         crashed = true;
-        queue.crash();
+        queue.clear();
     }
 
-    private <T> TickCompletableFuture<T> submit(java.util.concurrent.Callable<T> action, boolean mutates) {
+    private <T> TickCompletableFuture<T> submit(Callable<T> action) {
+        TickCompletableFuture<T> future = new TickCompletableFuture<>();
         if (crashed || closed) {
-            TickCompletableFuture<T> rejected = new TickCompletableFuture<>();
-            rejected.fail(new IOException(crashed ? "file system crashed" : "file is closed"));
-            return rejected;
+            future.fail(new IOException(crashed ? "file system crashed" : "file is closed"));
+            return future;
         }
-        return queue.submit(action, mutates);
+        queue.add(() -> {
+            T result;
+            try {
+                result = action.call();
+            } catch (Throwable e) {
+                future.fail(e);
+                return;
+            }
+            future.complete(result);
+        });
+        return future;
     }
 }

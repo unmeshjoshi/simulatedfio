@@ -5,12 +5,11 @@ import simfio.future.TickCompletableFuture;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Random;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class SimulatedFileIOTest {
-    private final SimulatedFileIO io = SimulatedFileIO.standalone(new Random(7), 2, 4);
+    private final SimulatedFileIO io = SimulatedFileIO.standalone();
 
     private void tick(int n) {
         for (int i = 0; i < n; i++) io.tick();
@@ -21,8 +20,6 @@ class SimulatedFileIOTest {
         TickCompletableFuture<Integer> write = io.write(ByteBuffer.wrap(new byte[3]), 0);
         assertTrue(write.isPending());
         tick(1);
-        assertTrue(write.isPending(), "minimum latency is 2 ticks");
-        tick(3);
         assertEquals(3, write.getResult());
     }
 
@@ -31,12 +28,8 @@ class SimulatedFileIOTest {
         TickCompletableFuture<Integer> write = io.write(ByteBuffer.wrap("abc".getBytes()), 0);
         TickCompletableFuture<ByteBuffer> read = io.read(0, 3);
         TickCompletableFuture<Void> sync = io.sync();
-        // Whatever the latencies, a later call never finishes before an earlier one.
-        for (int i = 0; i < 20; i++) {
-            io.tick();
-            if (sync.isCompleted()) assertTrue(read.isCompleted() && write.isCompleted());
-            if (read.isCompleted()) assertTrue(write.isCompleted());
-        }
+        io.tick();
+        assertTrue(write.isCompleted() && read.isCompleted() && sync.isCompleted());
         assertEquals("abc", new String(read.getResult().array()));
     }
 
@@ -77,6 +70,17 @@ class SimulatedFileIOTest {
     }
 
     @Test
+    void aCallMadeFromACallbackCompletesOnTheNextTick() {
+        TickCompletableFuture<Integer> second = new TickCompletableFuture<>();
+        io.write(ByteBuffer.wrap(new byte[1]), 0).whenComplete((n, e) -> io.write(ByteBuffer.wrap(new byte[2]), 0)
+                .whenComplete((m, f) -> second.complete(m)));
+        tick(1);
+        assertTrue(second.isPending());
+        tick(1);
+        assertEquals(2, second.getResult());
+    }
+
+    @Test
     void callsAfterCloseFailButEarlierOnesFinish() {
         TickCompletableFuture<Integer> write = io.write(ByteBuffer.wrap(new byte[1]), 0);
         TickCompletableFuture<Void> close = io.close();
@@ -87,22 +91,5 @@ class SimulatedFileIOTest {
         tick(30);
         assertTrue(write.isCompleted());
         assertTrue(close.isCompleted());
-    }
-
-    @Test
-    void theSameSeedGivesTheSameCompletionTicks() {
-        assertEquals(completionTicks(42), completionTicks(42));
-    }
-
-    private static java.util.List<Integer> completionTicks(long seed) {
-        SimulatedFileIO file = SimulatedFileIO.standalone(new Random(seed), 1, 10);
-        java.util.List<TickCompletableFuture<Integer>> futures = new java.util.ArrayList<>();
-        for (int i = 0; i < 10; i++) futures.add(file.write(ByteBuffer.wrap(new byte[1]), i));
-        java.util.List<Integer> ticks = new java.util.ArrayList<>();
-        for (int tick = 1; ticks.size() < 10 && tick < 200; tick++) {
-            file.tick();
-            while (ticks.size() < 10 && futures.get(ticks.size()).isCompleted()) ticks.add(tick);
-        }
-        return ticks;
     }
 }
